@@ -181,8 +181,13 @@ def grpc_deps():
     )
 
     native.bind(
-        name = "uv",
-        actual = "@libuv//:libuv",
+        name = "libuv",
+        actual = "@com_github_libuv_libuv//:libuv",
+    )
+
+    native.bind(
+        name = "libuv_test",
+        actual = "@com_github_libuv_libuv//:libuv_test",
     )
 
     if "boringssl" not in native.existing_rules():
@@ -339,11 +344,11 @@ def grpc_deps():
     if "upb" not in native.existing_rules():
         http_archive(
             name = "upb",
-            sha256 = "7c02096dceb6b1249feaf11e4531f6bf31b9abdbd2305038349d1f1749bf88ea",
-            strip_prefix = "upb-0e0de7d9f927aa888d9a0baeaf6576bbbb23bf0b",
+            sha256 = "1cd33bf607ebc83acf71b6078c1d4361ffa49d647a2ce792a557ae98f75500ad",
+            strip_prefix = "upb-a02d92e0257a35f11d4a58b6a932506cbdbb2f29",
             urls = [
-                "https://storage.googleapis.com/grpc-bazel-mirror/github.com/protocolbuffers/upb/archive/0e0de7d9f927aa888d9a0baeaf6576bbbb23bf0b.tar.gz",
-                "https://github.com/protocolbuffers/upb/archive/0e0de7d9f927aa888d9a0baeaf6576bbbb23bf0b.tar.gz",
+                "https://storage.googleapis.com/grpc-bazel-mirror/github.com/protocolbuffers/upb/archive/a02d92e0257a35f11d4a58b6a932506cbdbb2f29.tar.gz",
+                "https://github.com/protocolbuffers/upb/archive/a02d92e0257a35f11d4a58b6a932506cbdbb2f29.tar.gz",
             ],
         )
 
@@ -388,9 +393,9 @@ def grpc_deps():
             ],
         )
 
-    if "libuv" not in native.existing_rules():
+    if "com_github_libuv_libuv" not in native.existing_rules():
         http_archive(
-            name = "libuv",
+            name = "com_github_libuv_libuv",
             build_file = "@com_github_grpc_grpc//third_party:libuv.BUILD",
             sha256 = "5ca4e9091f3231d8ad8801862dc4e851c23af89c69141d27723157776f7291e7",
             strip_prefix = "libuv-02a9e1be252b623ee032a3137c0b0c94afbe6809",

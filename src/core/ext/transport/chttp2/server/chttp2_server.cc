@@ -55,6 +55,7 @@
 #include "src/core/lib/resource_quota/memory_quota.h"
 #include "src/core/lib/security/context/security_context.h"
 #include "src/core/lib/security/credentials/credentials.h"
+#include "src/core/lib/security/credentials/insecure/insecure_credentials.h"
 #include "src/core/lib/slice/slice_internal.h"
 #include "src/core/lib/surface/api_trace.h"
 #include "src/core/lib/surface/server.h"
@@ -147,7 +148,7 @@ class Chttp2ServerListener : public Server::ListenerInterface {
       RefCountedPtr<HandshakeManager> handshake_mgr_
           ABSL_GUARDED_BY(&connection_->mu_);
       // State for enforcing handshake timeout on receiving HTTP/2 settings.
-      grpc_millis const deadline_;
+      Timestamp const deadline_;
       grpc_timer timer_ ABSL_GUARDED_BY(&connection_->mu_);
       grpc_closure on_timeout_ ABSL_GUARDED_BY(&connection_->mu_);
       grpc_closure on_receive_settings_ ABSL_GUARDED_BY(&connection_->mu_);
@@ -334,10 +335,10 @@ void Chttp2ServerListener::ConfigFetcherWatcher::StopServing() {
 // Chttp2ServerListener::ActiveConnection::HandshakingState
 //
 
-grpc_millis GetConnectionDeadline(const grpc_channel_args* args) {
-  int timeout_ms =
+Timestamp GetConnectionDeadline(const grpc_channel_args* args) {
+  auto timeout_ms = Duration::Milliseconds(
       grpc_channel_args_find_integer(args, GRPC_ARG_SERVER_HANDSHAKE_TIMEOUT_MS,
-                                     {120 * GPR_MS_PER_SEC, 1, INT_MAX});
+                                     {120 * GPR_MS_PER_SEC, 1, INT_MAX}));
   return ExecCtx::Get()->Now() + timeout_ms;
 }
 
@@ -566,10 +567,10 @@ void Chttp2ServerListener::ActiveConnection::SendGoAway() {
                         this, nullptr);
       grpc_timer_init(&drain_grace_timer_,
                       ExecCtx::Get()->Now() +
-                          grpc_channel_args_find_integer(
+                          Duration::Milliseconds(grpc_channel_args_find_integer(
                               listener_->args_,
                               GRPC_ARG_SERVER_CONFIG_CHANGE_DRAIN_GRACE_TIME_MS,
-                              {10 * 60 * GPR_MS_PER_SEC, 0, INT_MAX}),
+                              {10 * 60 * GPR_MS_PER_SEC, 0, INT_MAX})),
                       &on_drain_grace_time_expiry_);
       drain_grace_timer_expiry_callback_pending_ = true;
       shutdown_ = true;
@@ -1059,7 +1060,7 @@ void grpc_server_add_channel_from_fd(grpc_server* server, int fd,
                                      grpc_server_credentials* creds) {
   // For now, we only support insecure server credentials
   if (creds == nullptr ||
-      strcmp(creds->type(), GRPC_CREDENTIALS_TYPE_INSECURE) != 0) {
+      creds->type() != grpc_core::InsecureServerCredentials::Type()) {
     gpr_log(GPR_ERROR, "Failed to create channel due to invalid creds");
     return;
   }

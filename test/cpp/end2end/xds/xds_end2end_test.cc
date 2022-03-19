@@ -72,6 +72,7 @@
 #include "src/core/lib/gpr/tmpfile.h"
 #include "src/core/lib/gprpp/ref_counted_ptr.h"
 #include "src/core/lib/gprpp/sync.h"
+#include "src/core/lib/gprpp/time.h"
 #include "src/core/lib/gprpp/time_util.h"
 #include "src/core/lib/iomgr/load_file.h"
 #include "src/core/lib/iomgr/sockaddr.h"
@@ -394,7 +395,15 @@ class FakeCertificateProvider final : public grpc_tls_certificate_provider {
     return distributor_;
   }
 
+  const char* type() const override { return "fake"; }
+
  private:
+  int CompareImpl(const grpc_tls_certificate_provider* other) const override {
+    // TODO(yashykt): Maybe do something better here.
+    return grpc_core::QsortCompare(
+        static_cast<const grpc_tls_certificate_provider*>(this), other);
+  }
+
   grpc_core::RefCountedPtr<grpc_tls_certificate_distributor> distributor_;
   CertDataMap cert_data_map_;
 };
@@ -477,17 +486,17 @@ class NoOpHttpFilter : public grpc_core::XdsHttpFilterImpl {
         supported_on_servers_(supported_on_servers),
         is_terminal_filter_(is_terminal_filter) {}
 
-  void PopulateSymtab(upb_symtab* /* symtab */) const override {}
+  void PopulateSymtab(upb_DefPool* /* symtab */) const override {}
 
   absl::StatusOr<grpc_core::XdsHttpFilterImpl::FilterConfig>
-  GenerateFilterConfig(upb_strview /* serialized_filter_config */,
-                       upb_arena* /* arena */) const override {
+  GenerateFilterConfig(upb_StringView /* serialized_filter_config */,
+                       upb_Arena* /* arena */) const override {
     return grpc_core::XdsHttpFilterImpl::FilterConfig{name_, grpc_core::Json()};
   }
 
   absl::StatusOr<grpc_core::XdsHttpFilterImpl::FilterConfig>
-  GenerateFilterConfigOverride(upb_strview /*serialized_filter_config*/,
-                               upb_arena* /*arena*/) const override {
+  GenerateFilterConfigOverride(upb_StringView /*serialized_filter_config*/,
+                               upb_Arena* /*arena*/) const override {
     return grpc_core::XdsHttpFilterImpl::FilterConfig{name_, grpc_core::Json()};
   }
 
@@ -517,8 +526,9 @@ class NoOpHttpFilter : public grpc_core::XdsHttpFilterImpl {
 // clock API. It's unclear if they are using the same syscall, but we do know
 // GPR round the number at millisecond-level. This creates a 1ms difference,
 // which could cause flake.
-grpc_millis NowFromCycleCounter() {
-  return grpc_timespec_to_millis_round_down(gpr_now(GPR_CLOCK_MONOTONIC));
+grpc_core::Timestamp NowFromCycleCounter() {
+  return grpc_core::Timestamp::FromTimespecRoundDown(
+      gpr_now(GPR_CLOCK_MONOTONIC));
 }
 
 // Returns the number of RPCs needed to pass error_tolerance at 99.99994%
@@ -1887,7 +1897,7 @@ class XdsEnd2endTest : public ::testing::TestWithParam<TestType> {
   struct ConcurrentRpc {
     ClientContext context;
     Status status;
-    grpc_millis elapsed_time;
+    grpc_core::Duration elapsed_time;
     EchoResponse response;
   };
 
@@ -1905,7 +1915,7 @@ class XdsEnd2endTest : public ::testing::TestWithParam<TestType> {
     for (size_t i = 0; i < num_rpcs; i++) {
       ConcurrentRpc* rpc = &rpcs[i];
       rpc_options.SetupRpc(&rpc->context, &request);
-      grpc_millis t0 = NowFromCycleCounter();
+      grpc_core::Timestamp t0 = NowFromCycleCounter();
       stub->async()->Echo(&rpc->context, &request, &rpc->response,
                           [rpc, &mu, &completed, &cv, num_rpcs, t0](Status s) {
                             rpc->status = s;
@@ -1965,6 +1975,30 @@ class BasicTest : public XdsEnd2endTest {
 // Tests that the balancer sends the correct response to the client, and the
 // client sends RPCs to the backends using the default child policy.
 TEST_P(BasicTest, Vanilla) {
+  const size_t kNumRpcsPerAddress = 100;
+  EdsResourceArgs args({
+      {"locality0", CreateEndpointsForBackends()},
+  });
+  balancer_->ads_service()->SetEdsResource(BuildEdsResource(args));
+  // Make sure that trying to connect works without a call.
+  channel_->GetState(true /* try_to_connect */);
+  // We need to wait for all backends to come online.
+  WaitForAllBackends();
+  // Send kNumRpcsPerAddress RPCs per server.
+  CheckRpcSendOk(kNumRpcsPerAddress * num_backends_);
+  // Each backend should have gotten 100 requests.
+  for (size_t i = 0; i < backends_.size(); ++i) {
+    EXPECT_EQ(kNumRpcsPerAddress,
+              backends_[i]->backend_service()->request_count());
+  }
+  // Check LB policy name for the channel.
+  EXPECT_EQ("xds_cluster_manager_experimental",
+            channel_->GetLoadBalancingPolicyName());
+}
+
+// Tests that the client can handle resource wrapped in a Resource message.
+TEST_P(BasicTest, ResourceWrappedInResourceMessage) {
+  balancer_->ads_service()->set_wrap_resources(true);
   const size_t kNumRpcsPerAddress = 100;
   EdsResourceArgs args({
       {"locality0", CreateEndpointsForBackends()},
@@ -2435,6 +2469,18 @@ TEST_P(XdsResolverOnlyTest, KeepUsingLastDataIfBalancerGoesDown) {
   balancer_->Start();
   // Wait for client to see backend 1.
   WaitForBackend(1);
+}
+
+TEST_P(XdsResolverOnlyTest, XdsStreamErrorPropagation) {
+  const std::string kErrorMessage = "test forced ADS stream failure";
+  balancer_->ads_service()->ForceADSFailure(
+      Status(StatusCode::RESOURCE_EXHAUSTED, kErrorMessage));
+  auto status = SendRpc();
+  gpr_log(GPR_INFO,
+          "XdsStreamErrorPropagation test: RPC got error: code=%d message=%s",
+          status.error_code(), status.error_message().c_str());
+  EXPECT_THAT(status.error_code(), StatusCode::UNAVAILABLE);
+  EXPECT_THAT(status.error_message(), ::testing::HasSubstr(kErrorMessage));
 }
 
 using GlobalXdsClientTest = BasicTest;
@@ -3450,10 +3496,11 @@ using LdsRdsTest = BasicTest;
 
 MATCHER_P2(AdjustedClockInRange, t1, t2, "equals time") {
   gpr_cycle_counter cycle_now = gpr_get_cycle_counter();
-  grpc_millis cycle_time = grpc_cycle_counter_to_millis_round_down(cycle_now);
-  grpc_millis time_spec =
-      grpc_timespec_to_millis_round_down(gpr_now(GPR_CLOCK_MONOTONIC));
-  grpc_millis now = arg + time_spec - cycle_time;
+  grpc_core::Timestamp cycle_time =
+      grpc_core::Timestamp::FromCycleCounterRoundDown(cycle_now);
+  grpc_core::Timestamp time_spec =
+      grpc_core::Timestamp::FromTimespecRoundDown(gpr_now(GPR_CLOCK_MONOTONIC));
+  grpc_core::Timestamp now = arg + (time_spec - cycle_time);
   bool ok = true;
   ok &= ::testing::ExplainMatchResult(::testing::Ge(t1), now, result_listener);
   ok &= ::testing::ExplainMatchResult(::testing::Lt(t2), now, result_listener);
@@ -4828,42 +4875,51 @@ TEST_P(LdsRdsTest, XdsRoutingApplyXdsTimeout) {
   SetListenerAndRouteConfiguration(balancer_.get(), std::move(listener),
                                    new_route_config);
   // Test grpc_timeout_header_max of 1.5 seconds applied
-  grpc_millis t0 = NowFromCycleCounter();
-  grpc_millis t1 =
-      t0 + kTimeoutGrpcTimeoutHeaderMaxSecond * 1000 + kTimeoutMillis;
-  grpc_millis t2 = t0 + kTimeoutMaxStreamDurationSecond * 1000 + kTimeoutMillis;
+  grpc_core::Timestamp t0 = NowFromCycleCounter();
+  grpc_core::Timestamp t1 =
+      t0 + grpc_core::Duration::Seconds(kTimeoutGrpcTimeoutHeaderMaxSecond) +
+      grpc_core::Duration::Milliseconds(kTimeoutMillis);
+  grpc_core::Timestamp t2 =
+      t0 + grpc_core::Duration::Seconds(kTimeoutMaxStreamDurationSecond) +
+      grpc_core::Duration::Milliseconds(kTimeoutMillis);
   CheckRpcSendFailure(
       CheckRpcSendFailureOptions()
-          .set_rpc_options(
-              RpcOptions()
-                  .set_rpc_service(SERVICE_ECHO1)
-                  .set_rpc_method(METHOD_ECHO1)
-                  .set_wait_for_ready(true)
-                  .set_timeout_ms(kTimeoutApplicationSecond * 1000))
+          .set_rpc_options(RpcOptions()
+                               .set_rpc_service(SERVICE_ECHO1)
+                               .set_rpc_method(METHOD_ECHO1)
+                               .set_wait_for_ready(true)
+                               .set_timeout_ms(grpc_core::Duration::Seconds(
+                                                   kTimeoutApplicationSecond)
+                                                   .millis()))
           .set_expected_error_code(StatusCode::DEADLINE_EXCEEDED));
   EXPECT_THAT(NowFromCycleCounter(), AdjustedClockInRange(t1, t2));
   // Test max_stream_duration of 2.5 seconds applied
   t0 = NowFromCycleCounter();
-  t1 = t0 + kTimeoutMaxStreamDurationSecond * 1000 + kTimeoutMillis;
-  t2 = t0 + kTimeoutHttpMaxStreamDurationSecond * 1000 + kTimeoutMillis;
+  t1 = t0 + grpc_core::Duration::Seconds(kTimeoutMaxStreamDurationSecond) +
+       grpc_core::Duration::Milliseconds(kTimeoutMillis);
+  t2 = t0 + grpc_core::Duration::Seconds(kTimeoutHttpMaxStreamDurationSecond) +
+       grpc_core::Duration::Milliseconds(kTimeoutMillis);
   CheckRpcSendFailure(
       CheckRpcSendFailureOptions()
-          .set_rpc_options(
-              RpcOptions()
-                  .set_rpc_service(SERVICE_ECHO2)
-                  .set_rpc_method(METHOD_ECHO2)
-                  .set_wait_for_ready(true)
-                  .set_timeout_ms(kTimeoutApplicationSecond * 1000))
+          .set_rpc_options(RpcOptions()
+                               .set_rpc_service(SERVICE_ECHO2)
+                               .set_rpc_method(METHOD_ECHO2)
+                               .set_wait_for_ready(true)
+                               .set_timeout_ms(grpc_core::Duration::Seconds(
+                                                   kTimeoutApplicationSecond)
+                                                   .millis()))
           .set_expected_error_code(StatusCode::DEADLINE_EXCEEDED));
   EXPECT_THAT(NowFromCycleCounter(), AdjustedClockInRange(t1, t2));
   // Test http_stream_duration of 3.5 seconds applied
   t0 = NowFromCycleCounter();
-  t1 = t0 + kTimeoutHttpMaxStreamDurationSecond * 1000 + kTimeoutMillis;
-  t2 = t0 + kTimeoutApplicationSecond * 1000 + kTimeoutMillis;
+  t1 = t0 + grpc_core::Duration::Seconds(kTimeoutHttpMaxStreamDurationSecond) +
+       grpc_core::Duration::Milliseconds(kTimeoutMillis);
+  t2 = t0 + grpc_core::Duration::Seconds(kTimeoutApplicationSecond) +
+       grpc_core::Duration::Milliseconds(kTimeoutMillis);
   CheckRpcSendFailure(
       CheckRpcSendFailureOptions()
           .set_rpc_options(RpcOptions().set_wait_for_ready(true).set_timeout_ms(
-              kTimeoutApplicationSecond * 1000))
+              grpc_core::Duration::Seconds(kTimeoutApplicationSecond).millis()))
           .set_expected_error_code(StatusCode::DEADLINE_EXCEEDED));
   EXPECT_THAT(NowFromCycleCounter(), AdjustedClockInRange(t1, t2));
 }
@@ -4994,7 +5050,7 @@ TEST_P(LdsRdsTest, XdsRoutingApplyApplicationTimeoutWhenHttpTimeoutExplicit0) {
   CheckRpcSendFailure(
       CheckRpcSendFailureOptions()
           .set_rpc_options(RpcOptions().set_wait_for_ready(true).set_timeout_ms(
-              kTimeoutApplicationSecond * 1000))
+              grpc_core::Duration::Seconds(kTimeoutApplicationSecond).millis()))
           .set_expected_error_code(StatusCode::DEADLINE_EXCEEDED));
   auto ellapsed_nano_seconds =
       std::chrono::duration_cast<std::chrono::nanoseconds>(system_clock::now() -
@@ -5014,7 +5070,7 @@ TEST_P(LdsRdsTest, XdsRoutingWithOnlyApplicationTimeout) {
   CheckRpcSendFailure(
       CheckRpcSendFailureOptions()
           .set_rpc_options(RpcOptions().set_wait_for_ready(true).set_timeout_ms(
-              kTimeoutApplicationSecond * 1000))
+              grpc_core::Duration::Seconds(kTimeoutApplicationSecond).millis()))
           .set_expected_error_code(StatusCode::DEADLINE_EXCEEDED));
   auto ellapsed_nano_seconds =
       std::chrono::duration_cast<std::chrono::nanoseconds>(system_clock::now() -
@@ -7538,13 +7594,11 @@ class XdsSecurityTest : public BasicTest {
     constexpr int kRetryCount = 100;
     int num_tries = 0;
     for (; num_tries < kRetryCount; num_tries++) {
-      // Give some time for the updates to propagate.
-      gpr_sleep_until(grpc_timeout_milliseconds_to_deadline(100));
+      // Restart the servers to force a reconnection so that previously
+      // connected subchannels are not used for the RPC.
+      ShutdownBackend(0);
+      StartBackend(0);
       if (test_expects_failure) {
-        // Restart the servers to force a reconnection so that previously
-        // connected subchannels are not used for the RPC.
-        ShutdownBackend(0);
-        StartBackend(0);
         if (SendRpc().ok()) {
           gpr_log(GPR_ERROR, "RPC succeeded. Failure expected. Trying again.");
           continue;
@@ -9422,7 +9476,7 @@ TEST_P(XdsEnabledServerStatusNotificationTest,
     streaming_rpcs[i].stream->Read(&response);
     EXPECT_EQ(request.message(), response.message());
   }
-  grpc_millis update_time = NowFromCycleCounter();
+  grpc_core::Timestamp update_time = NowFromCycleCounter();
   // Update the resource.
   SetLdsUpdate("", "", "fake_plugin1", "", false);
   // Wait for the updated resource to take effect.
@@ -9433,7 +9487,8 @@ TEST_P(XdsEnabledServerStatusNotificationTest,
     // Wait for the drain grace time to expire
     EXPECT_FALSE(streaming_rpcs[i].stream->Read(&response));
     // Make sure that the drain grace interval is honored.
-    EXPECT_GE(NowFromCycleCounter() - update_time, kDrainGraceTimeMs);
+    EXPECT_GE(NowFromCycleCounter() - update_time,
+              grpc_core::Duration::Milliseconds(kDrainGraceTimeMs));
     auto status = streaming_rpcs[i].stream->Finish();
     EXPECT_EQ(status.error_code(), grpc::StatusCode::UNAVAILABLE)
         << status.error_code() << ", " << status.error_message() << ", "
@@ -10502,21 +10557,8 @@ TEST_P(XdsRbacTestWithActionPermutations, MethodPostPermissionAnyPrincipal) {
   SendRpc([this]() { return CreateInsecureChannel(); }, {}, {},
           /*test_expects_failure=*/GetParam().rbac_action() == RBAC_Action_DENY,
           grpc::StatusCode::PERMISSION_DENIED);
-  // Test an RPC with a different method type
-  auto stub = grpc::testing::EchoTestService::NewStub(CreateInsecureChannel());
-  ClientContext context;
-  context.set_wait_for_ready(true);
-  context.set_deadline(grpc_timeout_milliseconds_to_deadline(2000));
-  context.set_cacheable(true);
-  EchoRequest request;
-  request.set_message(kRequestMessage);
-  EchoResponse response;
-  Status status = stub->Echo(&context, request, &response);
-  EXPECT_EQ(status.error_code(), GetParam().rbac_action() == RBAC_Action_DENY
-                                     ? grpc::StatusCode::OK
-                                     : grpc::StatusCode::PERMISSION_DENIED)
-      << status.error_code() << ", " << status.error_message() << ", "
-      << status.error_details() << ", " << context.debug_error_string();
+  // TODO(yashykt): When we start supporting GET/PUT requests in the future,
+  // this should be modified to test that they are NOT accepted with this rule.
 }
 
 TEST_P(XdsRbacTestWithActionPermutations, MethodGetPermissionAnyPrincipal) {
@@ -10534,26 +10576,13 @@ TEST_P(XdsRbacTestWithActionPermutations, MethodGetPermissionAnyPrincipal) {
   backends_[0]->notifier()->WaitOnServingStatusChange(
       absl::StrCat(ipv6_only_ ? "[::1]:" : "127.0.0.1:", backends_[0]->port()),
       grpc::StatusCode::OK);
-  // Send a cacheable RPC so that GET method is used
-  auto stub = grpc::testing::EchoTestService::NewStub(CreateInsecureChannel());
-  ClientContext context;
-  context.set_wait_for_ready(true);
-  context.set_deadline(grpc_timeout_milliseconds_to_deadline(2000));
-  context.set_cacheable(true);
-  EchoRequest request;
-  request.set_message(kRequestMessage);
-  EchoResponse response;
-  Status status = stub->Echo(&context, request, &response);
-  EXPECT_EQ(status.error_code(), GetParam().rbac_action() == RBAC_Action_ALLOW
-                                     ? grpc::StatusCode::OK
-                                     : grpc::StatusCode::PERMISSION_DENIED)
-      << status.error_code() << ", " << status.error_message() << ", "
-      << status.error_details() << ", " << context.debug_error_string();
-  // Test an RPC with a different method type
+  // Test that an RPC with a POST method gets rejected
   SendRpc(
       [this]() { return CreateInsecureChannel(); }, {}, {},
       /*test_expects_failure=*/GetParam().rbac_action() == RBAC_Action_ALLOW,
       grpc::StatusCode::PERMISSION_DENIED);
+  // TODO(yashykt): When we start supporting GET requests in the future, this
+  // should be modified to test that they are accepted with this rule.
 }
 
 TEST_P(XdsRbacTestWithActionPermutations, MethodPutPermissionAnyPrincipal) {
@@ -10571,26 +10600,13 @@ TEST_P(XdsRbacTestWithActionPermutations, MethodPutPermissionAnyPrincipal) {
   backends_[0]->notifier()->WaitOnServingStatusChange(
       absl::StrCat(ipv6_only_ ? "[::1]:" : "127.0.0.1:", backends_[0]->port()),
       grpc::StatusCode::OK);
-  // Send an idempotent RPC so that PUT method is used
-  auto stub = grpc::testing::EchoTestService::NewStub(CreateInsecureChannel());
-  ClientContext context;
-  context.set_wait_for_ready(true);
-  context.set_deadline(grpc_timeout_milliseconds_to_deadline(2000));
-  context.set_idempotent(true);
-  EchoRequest request;
-  request.set_message(kRequestMessage);
-  EchoResponse response;
-  Status status = stub->Echo(&context, request, &response);
-  EXPECT_EQ(status.error_code(), GetParam().rbac_action() == RBAC_Action_ALLOW
-                                     ? grpc::StatusCode::OK
-                                     : grpc::StatusCode::PERMISSION_DENIED)
-      << status.error_code() << ", " << status.error_message() << ", "
-      << status.error_details() << ", " << context.debug_error_string();
-  // Test an RPC with a different method type
+  // Test that an RPC with a POST method gets rejected
   SendRpc(
       [this]() { return CreateInsecureChannel(); }, {}, {},
       /*test_expects_failure=*/GetParam().rbac_action() == RBAC_Action_ALLOW,
       grpc::StatusCode::PERMISSION_DENIED);
+  // TODO(yashykt): When we start supporting PUT requests in the future, this
+  // should be modified to test that they are accepted with this rule.
 }
 
 TEST_P(XdsRbacTestWithActionPermutations, UrlPathPermissionAnyPrincipal) {
@@ -10845,21 +10861,8 @@ TEST_P(XdsRbacTestWithActionPermutations, AnyPermissionMethodPostPrincipal) {
   SendRpc([this]() { return CreateInsecureChannel(); }, {}, {},
           /*test_expects_failure=*/GetParam().rbac_action() == RBAC_Action_DENY,
           grpc::StatusCode::PERMISSION_DENIED);
-  // Test an RPC with a different method type
-  auto stub = grpc::testing::EchoTestService::NewStub(CreateInsecureChannel());
-  ClientContext context;
-  context.set_wait_for_ready(true);
-  context.set_deadline(grpc_timeout_milliseconds_to_deadline(2000));
-  context.set_cacheable(true);
-  EchoRequest request;
-  request.set_message(kRequestMessage);
-  EchoResponse response;
-  Status status = stub->Echo(&context, request, &response);
-  EXPECT_EQ(status.error_code(), GetParam().rbac_action() == RBAC_Action_DENY
-                                     ? grpc::StatusCode::OK
-                                     : grpc::StatusCode::PERMISSION_DENIED)
-      << status.error_code() << ", " << status.error_message() << ", "
-      << status.error_details() << ", " << context.debug_error_string();
+  // TODO(yashykt): When we start supporting GET/PUT requests in the future,
+  // this should be modified to test that they are NOT accepted with this rule.
 }
 
 TEST_P(XdsRbacTestWithActionPermutations, AnyPermissionMethodGetPrincipal) {
@@ -10877,25 +10880,13 @@ TEST_P(XdsRbacTestWithActionPermutations, AnyPermissionMethodGetPrincipal) {
   backends_[0]->notifier()->WaitOnServingStatusChange(
       absl::StrCat(ipv6_only_ ? "[::1]:" : "127.0.0.1:", backends_[0]->port()),
       grpc::StatusCode::OK);
-  // Send a cacheable RPC so that GET method is used
-  auto stub = grpc::testing::EchoTestService::NewStub(CreateInsecureChannel());
-  ClientContext context;
-  context.set_wait_for_ready(true);
-  context.set_deadline(grpc_timeout_milliseconds_to_deadline(2000));
-  context.set_cacheable(true);
-  EchoRequest request;
-  request.set_message(kRequestMessage);
-  EchoResponse response;
-  Status status = stub->Echo(&context, request, &response);
-  EXPECT_TRUE(GetParam().rbac_action() == RBAC_Action_ALLOW ? status.ok()
-                                                            : !status.ok())
-      << status.error_code() << ", " << status.error_message() << ", "
-      << status.error_details() << ", " << context.debug_error_string();
-  // Test an RPC with a different method type
+  // Test that an RPC with a POST method gets rejected
   SendRpc(
       [this]() { return CreateInsecureChannel(); }, {}, {},
       /*test_expects_failure=*/GetParam().rbac_action() == RBAC_Action_ALLOW,
       grpc::StatusCode::PERMISSION_DENIED);
+  // TODO(yashykt): When we start supporting GET requests in the future, this
+  // should be modified to test that they are accepted with this rule.
 }
 
 TEST_P(XdsRbacTestWithActionPermutations, AnyPermissionMethodPutPrincipal) {
@@ -10913,25 +10904,13 @@ TEST_P(XdsRbacTestWithActionPermutations, AnyPermissionMethodPutPrincipal) {
   backends_[0]->notifier()->WaitOnServingStatusChange(
       absl::StrCat(ipv6_only_ ? "[::1]:" : "127.0.0.1:", backends_[0]->port()),
       grpc::StatusCode::OK);
-  // Send an idempotent RPC so that PUT method is used
-  auto stub = grpc::testing::EchoTestService::NewStub(CreateInsecureChannel());
-  ClientContext context;
-  context.set_wait_for_ready(true);
-  context.set_deadline(grpc_timeout_milliseconds_to_deadline(2000));
-  context.set_idempotent(true);
-  EchoRequest request;
-  request.set_message(kRequestMessage);
-  EchoResponse response;
-  Status status = stub->Echo(&context, request, &response);
-  EXPECT_TRUE(GetParam().rbac_action() == RBAC_Action_ALLOW ? status.ok()
-                                                            : !status.ok())
-      << status.error_code() << ", " << status.error_message() << ", "
-      << status.error_details() << ", " << context.debug_error_string();
-  // Test an RPC with a different method type
+  // Test that an RPC with a POST method gets rejected
   SendRpc(
       [this]() { return CreateInsecureChannel(); }, {}, {},
       /*test_expects_failure=*/GetParam().rbac_action() == RBAC_Action_ALLOW,
       grpc::StatusCode::PERMISSION_DENIED);
+  // TODO(yashykt): When we start supporting PUT requests in the future, this
+  // should be modified to test that they are accepted with this rule.
 }
 
 TEST_P(XdsRbacTestWithActionPermutations, AnyPermissionUrlPathPrincipal) {
@@ -12678,7 +12657,8 @@ TEST_P(FaultInjectionTest, XdsFaultInjectionAlwaysDelayPercentageAbort) {
   std::vector<ConcurrentRpc> rpcs =
       SendConcurrentRpcs(stub_.get(), kNumRpcs, rpc_options);
   for (auto& rpc : rpcs) {
-    EXPECT_GE(rpc.elapsed_time, kFixedDelaySeconds * 1000);
+    EXPECT_GE(rpc.elapsed_time,
+              grpc_core::Duration::Seconds(kFixedDelaySeconds));
     if (rpc.status.error_code() == StatusCode::OK) continue;
     EXPECT_EQ("Fault injected", rpc.status.error_message());
     ++num_aborted;
@@ -12739,7 +12719,8 @@ TEST_P(FaultInjectionTest,
   std::vector<ConcurrentRpc> rpcs =
       SendConcurrentRpcs(stub_.get(), kNumRpcs, rpc_options);
   for (auto& rpc : rpcs) {
-    EXPECT_GE(rpc.elapsed_time, kFixedDelaySeconds * 1000);
+    EXPECT_GE(rpc.elapsed_time,
+              grpc_core::Duration::Seconds(kFixedDelaySeconds));
     if (rpc.status.error_code() == StatusCode::OK) continue;
     EXPECT_EQ("Fault injected", rpc.status.error_message());
     ++num_aborted;

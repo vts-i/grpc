@@ -39,6 +39,7 @@
 #include "src/core/ext/filters/http/server/http_server_filter.h"
 #include "src/core/ext/filters/message_size/message_size_filter.h"
 #include "src/core/lib/channel/channel_stack.h"
+#include "src/core/lib/channel/channel_stack_builder_impl.h"
 #include "src/core/lib/channel/connected_channel.h"
 #include "src/core/lib/config/core_configuration.h"
 #include "src/core/lib/iomgr/call_combiner.h"
@@ -555,7 +556,7 @@ static void BM_IsolatedFilter(benchmark::State& state) {
   grpc_core::ExecCtx::Get()->Flush();
   grpc_call_stack* call_stack =
       static_cast<grpc_call_stack*>(gpr_zalloc(channel_stack->call_stack_size));
-  grpc_millis deadline = GRPC_MILLIS_INF_FUTURE;
+  grpc_core::Timestamp deadline = grpc_core::Timestamp::InfFuture();
   gpr_cycle_counter start_time = gpr_get_cycle_counter();
   grpc_slice method = grpc_slice_from_static_string("/foo/bar");
   grpc_call_final_info final_info;
@@ -723,7 +724,7 @@ class IsolatedCallFixture : public TrackCounters {
     const grpc_channel_args* args = grpc_core::CoreConfiguration::Get()
                                         .channel_args_preconditioning()
                                         .PreconditionChannelArgs(nullptr);
-    grpc_core::ChannelStackBuilder builder("phony");
+    grpc_core::ChannelStackBuilderImpl builder("phony", GRPC_CLIENT_CHANNEL);
     builder.SetTarget("phony_target");
     builder.SetChannelArgs(args);
     builder.AppendFilter(&isolated_call_filter::isolated_call_filter, nullptr);

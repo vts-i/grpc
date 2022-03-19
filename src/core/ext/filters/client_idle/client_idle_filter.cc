@@ -54,12 +54,14 @@ TraceFlag grpc_trace_client_idle_filter(false, "client_idle_filter");
 
 namespace {
 
-grpc_millis GetClientIdleTimeout(const grpc_channel_args* args) {
-  return std::max(
+Duration GetClientIdleTimeout(const grpc_channel_args* args) {
+  auto millis = std::max(
       grpc_channel_arg_get_integer(
           grpc_channel_args_find(args, GRPC_ARG_CLIENT_IDLE_TIMEOUT_MS),
           {DEFAULT_IDLE_TIMEOUT_MS, 0, INT_MAX}),
       MIN_IDLE_TIMEOUT_MS);
+  if (millis == INT_MAX) return Duration::Infinity();
+  return Duration::Milliseconds(millis);
 }
 
 class ClientIdleFilter : public ChannelFilter {
@@ -74,15 +76,14 @@ class ClientIdleFilter : public ChannelFilter {
   ClientIdleFilter& operator=(ClientIdleFilter&&) = default;
 
   // Construct a promise for one call.
-  ArenaPromise<TrailingMetadata> MakeCallPromise(
-      ClientInitialMetadata initial_metadata,
-      NextPromiseFactory next_promise_factory) override;
+  ArenaPromise<ServerMetadataHandle> MakeCallPromise(
+      CallArgs call_args, NextPromiseFactory next_promise_factory) override;
 
   bool StartTransportOp(grpc_transport_op* op) override;
 
  private:
   ClientIdleFilter(grpc_channel_stack* channel_stack,
-                   grpc_millis client_idle_timeout)
+                   Duration client_idle_timeout)
       : channel_stack_(channel_stack),
         client_idle_timeout_(client_idle_timeout) {}
 
@@ -99,7 +100,7 @@ class ClientIdleFilter : public ChannelFilter {
 
   // The channel stack to which we take refs for pending callbacks.
   grpc_channel_stack* channel_stack_;
-  grpc_millis client_idle_timeout_;
+  Duration client_idle_timeout_;
   std::shared_ptr<IdleFilterState> idle_filter_state_{
       std::make_shared<IdleFilterState>(false)};
 
@@ -114,15 +115,14 @@ absl::StatusOr<ClientIdleFilter> ClientIdleFilter::Create(
 }
 
 // Construct a promise for one call.
-ArenaPromise<TrailingMetadata> ClientIdleFilter::MakeCallPromise(
-    ClientInitialMetadata initial_metadata,
-    NextPromiseFactory next_promise_factory) {
+ArenaPromise<ServerMetadataHandle> ClientIdleFilter::MakeCallPromise(
+    CallArgs call_args, NextPromiseFactory next_promise_factory) {
   using Decrementer = std::unique_ptr<ClientIdleFilter, CallCountDecreaser>;
   IncreaseCallCount();
-  return ArenaPromise<TrailingMetadata>(Capture(
-      [](Decrementer*, ArenaPromise<TrailingMetadata>* next)
-          -> Poll<TrailingMetadata> { return (*next)(); },
-      Decrementer(this), next_promise_factory(std::move(initial_metadata))));
+  return ArenaPromise<ServerMetadataHandle>(
+      Capture([](Decrementer*, ArenaPromise<ServerMetadataHandle>* next)
+                  -> Poll<ServerMetadataHandle> { return (*next)(); },
+              Decrementer(this), next_promise_factory(std::move(call_args))));
 }
 
 bool ClientIdleFilter::StartTransportOp(grpc_transport_op* op) {
@@ -190,7 +190,7 @@ void RegisterClientIdleFilter(CoreConfiguration::Builder* builder) {
       [](ChannelStackBuilder* builder) {
         const grpc_channel_args* channel_args = builder->channel_args();
         if (!grpc_channel_args_want_minimal_stack(channel_args) &&
-            GetClientIdleTimeout(channel_args) != INT_MAX) {
+            GetClientIdleTimeout(channel_args) != Duration::Infinity()) {
           builder->PrependFilter(&grpc_client_idle_filter, nullptr);
         }
         return true;
